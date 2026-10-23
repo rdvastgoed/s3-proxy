@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -14,7 +15,42 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/smithy-go"
+	"github.com/aws/smithy-go/middleware"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
+
+type acceptEncodingKey struct{}
+
+// excludeAcceptEncodingFromSignature keeps Accept-Encoding out of the SigV4
+// signed headers. Google Cloud Storage's S3 interoperability rewrites that
+// header in its frontend and then rejects the signature (SignatureDoesNotMatch).
+// The header is removed before signing and put back afterwards, so it is still
+// sent but not signed.
+func excludeAcceptEncodingFromSignature(stack *middleware.Stack) error {
+	if err := stack.Finalize.Insert(middleware.FinalizeMiddlewareFunc("s3proxyStripAcceptEncoding",
+		func(ctx context.Context, in middleware.FinalizeInput, next middleware.FinalizeHandler) (middleware.FinalizeOutput, middleware.Metadata, error) {
+			if req, ok := in.Request.(*smithyhttp.Request); ok {
+				ctx = context.WithValue(ctx, acceptEncodingKey{}, req.Header.Get("Accept-Encoding"))
+				req.Header.Del("Accept-Encoding")
+			}
+			return next.HandleFinalize(ctx, in)
+		}), "Signing", middleware.Before); err != nil {
+		return err
+	}
+	return stack.Finalize.Insert(middleware.FinalizeMiddlewareFunc("s3proxyRestoreAcceptEncoding",
+		func(ctx context.Context, in middleware.FinalizeInput, next middleware.FinalizeHandler) (middleware.FinalizeOutput, middleware.Metadata, error) {
+			if req, ok := in.Request.(*smithyhttp.Request); ok {
+				if ae, _ := ctx.Value(acceptEncodingKey{}).(string); ae != "" {
+					req.Header.Set("Accept-Encoding", ae)
+				}
+			}
+			return next.HandleFinalize(ctx, in)
+		}), "Signing", middleware.After)
+}
+
+func isGCSEndpoint(endpoint string) bool {
+	return strings.Contains(endpoint, "storage.googleapis.com")
+}
 
 var (
 	ErrNotFound     = errors.New("object not found")
@@ -63,6 +99,9 @@ func New(ctx context.Context, endpoint, region, accessKey, secretKey, bucket str
 		o.UsePathStyle = true
 		if endpoint != "" {
 			o.BaseEndpoint = aws.String(endpoint)
+		}
+		if isGCSEndpoint(endpoint) {
+			o.APIOptions = append(o.APIOptions, excludeAcceptEncodingFromSignature)
 		}
 	})
 
